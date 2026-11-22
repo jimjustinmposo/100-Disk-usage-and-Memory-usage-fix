@@ -205,6 +205,7 @@ class App:
         self.growth = {}
         self.extra = {}
         self.report = None
+        self.ram_baseline = None
         self.build()
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         threading.Thread(target=self.monitor, daemon=True).start()
@@ -271,6 +272,12 @@ class App:
             self.table.heading(col, text=title)
             self.table.column(col, width=width, stretch=True)
         self.table.pack(fill='both', expand=True)
+        ram_tools = tk.Frame(dash, bg=PANEL)
+        ram_tools.pack(fill='x', pady=(6, 0))
+        ttk.Button(ram_tools, text='Measure RAM after closing apps', command=self.compare_ram).pack(side='left')
+        ttk.Button(ram_tools, text='Open Task Manager', command=self.open_task_manager).pack(side='left', padx=8)
+        tk.Button(dash, text='Review selected memory consumer', command=self.review_consumer,
+                  bg=GREEN, fg=BG, relief='flat', padx=12, pady=5).pack(anchor='w', pady=(6, 0))
         self.advice = self.textbox(advice)
         self.reportbox = self.textbox(report)
         self.set_text(self.reportbox, 'No optimization has run.\n\nMeasurements are real; no example or simulated results are shown.\n\nOne click checks Windows memory compression and system-managed paging. A newly verified restore point is required before any setting changes. The app never terminates another process, purges system caches, disables startup apps, or deletes files.\n\nRollback restores only settings changed by this app. It cannot reverse elapsed activity or a reboot. Full system recovery is available through Windows System Restore.')
@@ -434,9 +441,12 @@ $result|ConvertTo-Json -Depth 5 -Compress
         self.metrics.configure(text=f"RAM {s['percent']:.1f}%  •  System cache {cache}  •  Compressed {compressed_label}\n"
             f"Committed {gb(s['commit'])} / {gb(s['commitLimit'])}  •  Page file {gb(s['pageUsed'])} / {gb(s['pageTotal'])}\n"
             f"Pages input/sec: {self.extra.get('pagesInput', 'Unavailable')}  •  Disk activity: {disk_label}  •  Updated {s['time'][11:19]}")
+        selected = self.table.selection()
         self.table.delete(*self.table.get_children())
         for p in s['top']:
-            self.table.insert('', 'end', values=(p['name'], p['pid'], mb(p['rss']), mb(p['private']), 'Suspected growth' if p['growth'] else 'Observing'))
+            self.table.insert('', 'end', iid=str(p['pid']), values=(p['name'], p['pid'], mb(p['rss']), mb(p['private']), 'Suspected growth' if p['growth'] else 'Observing'))
+        if selected and self.table.exists(selected[0]):
+            self.table.selection_set(selected[0])
         c = self.chart
         c.delete('all')
         w, h = max(300, c.winfo_width()), 120
@@ -462,6 +472,48 @@ $result|ConvertTo-Json -Depth 5 -Compress
             except Exception as exc: self.events.put(('done', {'error': str(exc)}))
         threading.Thread(target=work, daemon=True).start()
 
+    def review_consumer(self):
+        selection = self.table.selection()
+        if not selection:
+            self.status.configure(text='Select a process in Top memory consumers first.')
+            return
+        name, pid, working_set, private, _ = self.table.item(selection[0], 'values')
+        hints = {
+            'msedge.exe': 'In Edge, press Shift+Esc to see memory by tab and extension.',
+            'chrome.exe': 'In Chrome, press Shift+Esc to see memory by tab and extension.',
+            'firefox.exe': 'In Firefox, open about:processes to see memory by tab.',
+        }
+        tip = hints.get(name.lower(), 'If you recognize this as an app you can spare, save your work and close it normally. Leave Windows and security processes alone.')
+        messagebox.showinfo('Review memory consumer', f'{name} (PID {pid})\nWorking set: {working_set}\nPrivate commit: {private}\n\n{tip}\n\nWatch Available RAM on the dashboard after closing unused work. Working set includes shared memory, so the full amount may not be recovered.')
+
+    def open_task_manager(self):
+        try:
+            os.startfile(str(Path(os.environ['SystemRoot']) / 'System32' / 'Taskmgr.exe'))
+        except OSError as exc:
+            messagebox.showerror('Task Manager unavailable', str(exc))
+
+    def compare_ram(self):
+        if not self.latest:
+            return
+        now = dict(self.latest)
+        if self.ram_baseline is None:
+            self.ram_baseline = now
+            self.status.configure(text=f"Baseline saved: {gb(now['available'])} available. Close unused apps or tabs, then click Measure RAM again.")
+            return
+        before = self.ram_baseline
+        if now['time'] == before['time']:
+            self.status.configure(text='Waiting for a fresh RAM reading. Try again after the dashboard updates.')
+            return
+        self.ram_baseline = None
+        delta = now['available'] - before['available']
+        trend = 'more' if delta >= 0 else 'less'
+        outcome = ('No measurable change' if abs(delta) < 1024**2
+                   else f'{mb(abs(delta))} {trend} available')
+        result = f"Available RAM: {gb(before['available'])} → {gb(now['available'])}. {outcome}."
+        self.status.configure(text=result)
+        self.report = {'summary': result, 'before': before, 'after': now}
+        self.set_text(self.reportbox, result)
+
     def run_optimization(self):
         if not self.latest: return
         if not ctypes.windll.shell32.IsUserAnAdmin():
@@ -476,7 +528,15 @@ $result|ConvertTo-Json -Depth 5 -Compress
             after = dict(self.latest or before)
             disk_after = self.extra.get('diskActive')
             disk_text = f'{disk_before:.0f}% → {disk_after:.0f}%' if disk_before is not None and disk_after is not None else 'Unavailable'
+            recovered = after['available'] - before['available']
+            if abs(recovered) < 64 * 1024**2:
+                outcome = 'No meaningful change in available RAM (less than 64 MB).'
+            elif recovered > 0:
+                outcome = f'Available RAM increased by {mb(recovered)} in the observed sample.'
+            else:
+                outcome = f'Available RAM decreased by {mb(-recovered)} in the observed sample.'
             text = '\n'.join(['OPTIMIZATION REPORT', dt.datetime.now().isoformat(timespec='seconds'), '',
+                outcome, 'Use Review selected memory consumer on the dashboard to act on a specific app.',
                 f"Memory: {gb(before['used'])} ({before['percent']:.1f}%) → {gb(after['used'])} ({after['percent']:.1f}%)",
                 'These are observed samples; changes are not proof of optimization benefit.',
                 f'Disk activity: {disk_text} (30-second counter; may be the same sample)',
@@ -488,7 +548,7 @@ $result|ConvertTo-Json -Depth 5 -Compress
                 'NEXT ACTIONS', 'Observe normal workload for several minutes. Restart later if paging settings changed.',
                 'Review startup apps and browser Task Manager. Review Windows Storage cleanup manually.',
                 'If pressure persists, investigate the top consumers and suspected growth before considering compatible RAM upgrades.'])
-            report = {'summary': 'Optimization checks completed. Review measured results and recommended next actions.',
+            report = {'summary': outcome,
                       'text': text, 'before': before, 'after': after, 'actions': actions, 'restorePoint': checkpoint}
             save_json(ROOT / ('report-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S') + '.json'), report)
             return report
